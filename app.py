@@ -8,7 +8,6 @@ Tablero interactivo con el mapa como eje central.
 """
 
 import json
-import inspect
 import unicodedata
 from typing import Dict, Any, Tuple, Optional, List
 
@@ -19,7 +18,6 @@ import plotly.graph_objects as go
 import altair as alt
 
 from supabase import create_client
-from supabase.lib.client_options import ClientOptions
 
 
 # ======================================================
@@ -346,17 +344,7 @@ def load_pba_geojson(path: str) -> Dict[str, Any]:
 # SUPABASE CLIENT
 # ======================================================
 def get_sb_client():
-    desired = {
-        "schema": "public",
-        "postgrest_client_timeout": 60,
-        "storage_client_timeout": 60,
-        "timeout": 60,
-    }
-    sig = inspect.signature(ClientOptions.__init__)
-    allowed = set(sig.parameters.keys())
-    filtered = {k: v for k, v in desired.items() if k in allowed}
-    opts = ClientOptions(**filtered) if filtered else ClientOptions()
-    return create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def _raise_if_error(res):
