@@ -36,6 +36,16 @@ SUPABASE_URL = st.secrets.get("SUPABASE_URL", "") or st.secrets.get("supabase", 
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "") or st.secrets.get("supabase", {}).get("key", "")
 USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 
+# Optional debug: show which secret keys are visible (no values).
+try:
+    debug_flag = st.query_params.get("debug", "")
+    if isinstance(debug_flag, list):
+        debug_flag = debug_flag[0]
+except Exception:
+    debug_flag = ""
+if str(debug_flag) == "1":
+    st.sidebar.info(f"Secrets keys: {sorted(list(st.secrets.keys()))}")
+
 
 # ======================================================
 # SESSION STATE
