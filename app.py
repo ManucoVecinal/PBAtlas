@@ -45,6 +45,12 @@ except Exception:
     debug_flag = ""
 if str(debug_flag) == "1":
     st.sidebar.info(f"Secrets keys: {sorted(list(st.secrets.keys()))}")
+    st.sidebar.info(
+        "Supabase config: "
+        f"url_len={len(str(SUPABASE_URL))}, "
+        f"key_len={len(str(SUPABASE_KEY))}, "
+        f"use={USE_SUPABASE}"
+    )
 
 
 # ======================================================
