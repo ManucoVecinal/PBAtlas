@@ -31,8 +31,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
+# Accept both top-level keys and [supabase] section in Streamlit secrets.
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "") or st.secrets.get("supabase", {}).get("url", "")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "") or st.secrets.get("supabase", {}).get("key", "")
 USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 
 
