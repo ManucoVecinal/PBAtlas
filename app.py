@@ -1166,7 +1166,7 @@ def render_sidebar_controls(df_base: pd.DataFrame):
         if selected_name == "— Vista Provincial —":
             if st.session_state.municipio_sel is not None:
                 reset_to_provincial()
-                st.experimental_rerun()
+                st.rerun()
         else:
             row = df_base[df_base["Muni_Nombre"] == selected_name]
             if not row.empty:
@@ -1175,14 +1175,14 @@ def render_sidebar_controls(df_base: pd.DataFrame):
                 new_georef = str(r["id_georef"])
                 if st.session_state.municipio_sel != new_id:
                     select_municipio(new_id, selected_name, new_georef)
-                    st.experimental_rerun()
+                    st.rerun()
 
     # Botón para volver a provincial
     if st.session_state.municipio_sel is not None:
         st.sidebar.divider()
         if st.sidebar.button("↩ Volver a Vista Provincial", type="primary", use_container_width=True):
             reset_to_provincial()
-            st.experimental_rerun()
+            st.rerun()
 
 
 def render_provincial_kpis(df_base: pd.DataFrame, df_metrics: pd.DataFrame, df_docs_count: pd.DataFrame):
