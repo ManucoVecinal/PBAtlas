@@ -198,7 +198,8 @@ def fmt_money_millions(x, digits: int = 1) -> str:
     try:
         v = float(x or 0)
         m = v / 1_000_000.0
-        s = f"{m:.{digits}f}".replace(".", ",")
+        # Formatear con separador de miles (punto) y decimal (coma) - formato argentino
+        s = f"{m:,.{digits}f}".replace(",", "X").replace(".", ",").replace("X", ".")
         return f"$ {s} M"
     except Exception:
         return "—"
@@ -363,7 +364,7 @@ def fetch_municipios_base() -> Tuple[pd.DataFrame, Optional[str]]:
         return pd.DataFrame(), "SUPABASE DESACTIVADO"
     try:
         sb = get_sb_client()
-        cols = "ID_Municipio,id_georef,Muni_Nombre,Muni_Poblacion_2022,Muni_Superficie,Muni_Cantidad_Trabajadores"
+        cols = "ID_Municipio,id_georef,Muni_Nombre,Muni_Poblacion_2022,Muni_Superficie,Muni_Cantidad_Trabajadores,Muni_SeccionElectoral"
         res = sb.table("bd_municipios").select(cols).limit(200).execute()
         _raise_if_error(res)
         df = pd.DataFrame(res.data or [])
@@ -562,6 +563,58 @@ def fetch_metricas_por_municipio() -> Tuple[pd.DataFrame, Optional[str]]:
             )
 
         return df_metrics, None
+    except Exception as e:
+        return pd.DataFrame(), repr(e)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_activos_por_municipio() -> Tuple[pd.DataFrame, Optional[str]]:
+    """Obtiene activos totales por municipio desde bd_situacionpatrimonial.
+
+    Suma SitPat_Saldo donde SitPat_Tipo = 'Activo' o 'ACTIVO' por municipio.
+    """
+    if not USE_SUPABASE:
+        return pd.DataFrame(), "SUPABASE DESACTIVADO"
+    try:
+        sb = get_sb_client()
+
+        # Obtener documentos con municipio
+        res_docs = sb.table("BD_DocumentosCargados").select("ID_DocumentoCargado,ID_Municipio").limit(50000).execute()
+        _raise_if_error(res_docs)
+        df_docs = pd.DataFrame(res_docs.data or [])
+
+        if df_docs.empty:
+            return pd.DataFrame(), None
+
+        doc_to_muni = dict(zip(df_docs["ID_DocumentoCargado"].astype(str), df_docs["ID_Municipio"].astype(str)))
+
+        # Obtener situación patrimonial
+        res_pat = sb.table("bd_situacionpatrimonial").select("ID_DocumentoCargado,SitPat_Tipo,SitPat_Saldo").limit(100000).execute()
+        _raise_if_error(res_pat)
+        df_pat = pd.DataFrame(res_pat.data or [])
+
+        if df_pat.empty:
+            return pd.DataFrame(columns=["ID_Municipio", "activo_total"]), None
+
+        # Filtrar solo Activos (case-insensitive: "Activo", "ACTIVO", etc.)
+        df_pat["SitPat_Tipo_norm"] = df_pat["SitPat_Tipo"].astype(str).str.strip().str.lower()
+        df_pat = df_pat[df_pat["SitPat_Tipo_norm"] == "activo"]
+
+        if df_pat.empty:
+            return pd.DataFrame(columns=["ID_Municipio", "activo_total"]), None
+
+        # Mapear a municipio
+        df_pat["ID_Municipio"] = df_pat["ID_DocumentoCargado"].astype(str).map(doc_to_muni)
+        df_pat = df_pat.dropna(subset=["ID_Municipio"])
+
+        # Convertir saldos a numérico
+        df_pat["SitPat_Saldo"] = pd.to_numeric(df_pat["SitPat_Saldo"], errors="coerce").fillna(0)
+
+        # Sumar por municipio
+        df_activos = df_pat.groupby("ID_Municipio")["SitPat_Saldo"].sum().reset_index()
+        df_activos.columns = ["ID_Municipio", "activo_total"]
+
+        return df_activos, None
     except Exception as e:
         return pd.DataFrame(), repr(e)
 
@@ -1166,7 +1219,7 @@ def render_sidebar_controls(df_base: pd.DataFrame):
         if selected_name == "— Vista Provincial —":
             if st.session_state.municipio_sel is not None:
                 reset_to_provincial()
-                st.rerun()
+                st.experimental_rerun()
         else:
             row = df_base[df_base["Muni_Nombre"] == selected_name]
             if not row.empty:
@@ -1175,14 +1228,14 @@ def render_sidebar_controls(df_base: pd.DataFrame):
                 new_georef = str(r["id_georef"])
                 if st.session_state.municipio_sel != new_id:
                     select_municipio(new_id, selected_name, new_georef)
-                    st.rerun()
+                    st.experimental_rerun()
 
     # Botón para volver a provincial
     if st.session_state.municipio_sel is not None:
         st.sidebar.divider()
         if st.sidebar.button("↩ Volver a Vista Provincial", type="primary", use_container_width=True):
             reset_to_provincial()
-            st.rerun()
+            st.experimental_rerun()
 
 
 def render_provincial_kpis(df_base: pd.DataFrame, df_metrics: pd.DataFrame, df_docs_count: pd.DataFrame):
@@ -1396,12 +1449,21 @@ def render_provincial_charts(df_base: pd.DataFrame, df_metrics: pd.DataFrame):
         st.info("No hay datos de métricas disponibles para graficar.")
         return
 
-    # Merge con nombres
+    # Merge con nombres y sección electoral
+    cols_base = ["ID_Municipio", "Muni_Nombre", "Muni_Poblacion_2022", "Muni_Superficie"]
+    if "Muni_SeccionElectoral" in df_base.columns:
+        cols_base.append("Muni_SeccionElectoral")
     df_chart = df_metrics.merge(
-        df_base[["ID_Municipio", "Muni_Nombre", "Muni_Poblacion_2022", "Muni_Superficie"]],
+        df_base[cols_base],
         on="ID_Municipio",
         how="left"
     )
+
+    # Obtener datos de activos
+    df_activos, err_activos = fetch_activos_por_municipio()
+    if not df_activos.empty and err_activos is None:
+        df_chart = df_chart.merge(df_activos, on="ID_Municipio", how="left")
+        df_chart["activo_total"] = df_chart["activo_total"].fillna(0)
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Top Municipios", "Distribución", "Comparativas", "Recursos vs Gastos", "Jurisdicciones y Programas"])
 
@@ -1409,50 +1471,61 @@ def render_provincial_charts(df_base: pd.DataFrame, df_metrics: pd.DataFrame):
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("**Top 10 por Recursos Percibidos**")
+            st.markdown("**Ranking por Recursos Percibidos**")
             if "recursos_percibido" in df_chart.columns:
-                top_rec = df_chart.nlargest(10, "recursos_percibido")
-                fig = px.bar(
-                    top_rec,
-                    x="recursos_percibido",
-                    y="Muni_Nombre",
-                    orientation="h",
-                    color="recursos_percibido",
-                    color_continuous_scale="Greens"
+                # Preparar dataframe para tabla
+                df_recursos_rank = df_chart[["Muni_Nombre", "recursos_percibido"]].copy()
+                if "Muni_SeccionElectoral" in df_chart.columns:
+                    df_recursos_rank["Muni_SeccionElectoral"] = df_chart["Muni_SeccionElectoral"]
+                df_recursos_rank = df_recursos_rank.dropna(subset=["recursos_percibido"])
+                df_recursos_rank = df_recursos_rank.sort_values("recursos_percibido", ascending=False).reset_index(drop=True)
+                df_recursos_rank.index = df_recursos_rank.index + 1  # Posición desde 1
+                df_recursos_rank.index.name = "Pos"
+
+                # Formatear monto en millones
+                df_recursos_rank["Monto (millones $)"] = df_recursos_rank["recursos_percibido"].apply(
+                    lambda x: f"$ {x/1_000_000:,.1f} M" if pd.notna(x) and x != 0 else "$ 0"
                 )
-                fig.update_layout(
-                    showlegend=False,
-                    coloraxis_showscale=False,
-                    yaxis={"categoryorder": "total ascending"},
-                    height=350,
-                    margin={"l": 0, "r": 0, "t": 0, "b": 0}
-                )
-                fig.update_xaxes(title="")
-                fig.update_yaxes(title="")
-                st.plotly_chart(fig, use_container_width=True)
+
+                # Seleccionar columnas para mostrar
+                cols_display = ["Muni_Nombre", "Monto (millones $)"]
+                if "Muni_SeccionElectoral" in df_recursos_rank.columns:
+                    cols_display = ["Muni_Nombre", "Muni_SeccionElectoral", "Monto (millones $)"]
+
+                df_recursos_rank = df_recursos_rank[cols_display]
+                df_recursos_rank.columns = ["Municipio", "Sección Electoral", "Monto"] if len(cols_display) == 3 else ["Municipio", "Monto"]
+
+                st.dataframe(df_recursos_rank, height=400, use_container_width=True)
 
         with col2:
-            st.markdown("**Top 10 por Gastos Pagados**")
-            if "gastos_pagado" in df_chart.columns:
-                top_gas = df_chart.nlargest(10, "gastos_pagado")
-                fig = px.bar(
-                    top_gas,
-                    x="gastos_pagado",
-                    y="Muni_Nombre",
-                    orientation="h",
-                    color="gastos_pagado",
-                    color_continuous_scale="Reds"
+            st.markdown("**Ranking por Tamaño Activo**")
+            if "activo_total" in df_chart.columns:
+                # Preparar dataframe para tabla (igual que recursos percibidos)
+                df_activo_rank = df_chart[["Muni_Nombre", "activo_total"]].copy()
+                if "Muni_SeccionElectoral" in df_chart.columns:
+                    df_activo_rank["Muni_SeccionElectoral"] = df_chart["Muni_SeccionElectoral"]
+                df_activo_rank = df_activo_rank.dropna(subset=["activo_total"])
+                df_activo_rank = df_activo_rank[df_activo_rank["activo_total"] > 0]
+                df_activo_rank = df_activo_rank.sort_values("activo_total", ascending=False).reset_index(drop=True)
+                df_activo_rank.index = df_activo_rank.index + 1  # Posición desde 1
+                df_activo_rank.index.name = "Pos"
+
+                # Formatear monto en millones
+                df_activo_rank["Monto (millones $)"] = df_activo_rank["activo_total"].apply(
+                    lambda x: f"$ {x/1_000_000:,.1f} M" if pd.notna(x) and x != 0 else "$ 0"
                 )
-                fig.update_layout(
-                    showlegend=False,
-                    coloraxis_showscale=False,
-                    yaxis={"categoryorder": "total ascending"},
-                    height=350,
-                    margin={"l": 0, "r": 0, "t": 0, "b": 0}
-                )
-                fig.update_xaxes(title="")
-                fig.update_yaxes(title="")
-                st.plotly_chart(fig, use_container_width=True)
+
+                # Seleccionar columnas para mostrar
+                cols_display = ["Muni_Nombre", "Monto (millones $)"]
+                if "Muni_SeccionElectoral" in df_activo_rank.columns:
+                    cols_display = ["Muni_Nombre", "Muni_SeccionElectoral", "Monto (millones $)"]
+
+                df_activo_rank = df_activo_rank[cols_display]
+                df_activo_rank.columns = ["Municipio", "Sección Electoral", "Monto"] if len(cols_display) == 3 else ["Municipio", "Monto"]
+
+                st.dataframe(df_activo_rank, height=400, use_container_width=True)
+            else:
+                st.info("No hay datos de activos disponibles.")
 
     with tab2:
         col1, col2 = st.columns(2)
@@ -1464,18 +1537,23 @@ def render_provincial_charts(df_base: pd.DataFrame, df_metrics: pd.DataFrame):
                     lambda r: r["recursos_percibido"] / r["Muni_Poblacion_2022"]
                     if r["Muni_Poblacion_2022"] > 0 else 0, axis=1
                 )
+                df_hist = df_chart[df_chart["recursos_pc"] > 0].copy()
                 fig = px.histogram(
-                    df_chart[df_chart["recursos_pc"] > 0],
+                    df_hist,
                     x="recursos_pc",
                     nbins=20,
                     color_discrete_sequence=["#2ecc71"]
                 )
                 fig.update_layout(
                     height=300,
-                    margin={"l": 0, "r": 0, "t": 0, "b": 0}
+                    margin={"l": 0, "r": 0, "t": 10, "b": 0}
                 )
-                fig.update_xaxes(title="$ per cápita")
-                fig.update_yaxes(title="Cantidad de municipios")
+                fig.update_xaxes(title="Recursos Percibidos Per Cápita ($ por habitante)")
+                fig.update_yaxes(title="Cantidad de Municipios")
+                # Simplificar tooltips
+                fig.update_traces(
+                    hovertemplate="Rango: %{x}<br>Municipios: %{y}<extra></extra>"
+                )
                 st.plotly_chart(fig, use_container_width=True)
 
         with col2:
@@ -1489,127 +1567,121 @@ def render_provincial_charts(df_base: pd.DataFrame, df_metrics: pd.DataFrame):
                 )
                 fig.update_layout(
                     height=300,
-                    margin={"l": 0, "r": 0, "t": 0, "b": 0}
+                    margin={"l": 0, "r": 0, "t": 10, "b": 0}
                 )
-                fig.update_xaxes(title="Balance Fiscal ($)")
-                fig.update_yaxes(title="Cantidad de municipios")
+                fig.update_xaxes(title="Balance Fiscal ($ millones)", tickformat=",.0f")
+                fig.update_yaxes(title="Cantidad de Municipios")
+                # Simplificar tooltips
+                fig.update_traces(
+                    hovertemplate="Rango: %{x}<br>Municipios: %{y}<extra></extra>"
+                )
                 st.plotly_chart(fig, use_container_width=True)
 
     with tab3:
         st.markdown("**Recursos vs Gastos por Municipio**")
+        st.caption("El tamaño del círculo representa la población del municipio (Censo 2022)")
         if "recursos_percibido" in df_chart.columns and "gastos_pagado" in df_chart.columns:
+            # Crear copia con valores en millones para el gráfico
+            df_scatter = df_chart.copy()
+            df_scatter["recursos_millones"] = df_scatter["recursos_percibido"] / 1_000_000
+            df_scatter["gastos_millones"] = df_scatter["gastos_pagado"] / 1_000_000
+            df_scatter["balance_millones"] = df_scatter["balance_fiscal"] / 1_000_000 if "balance_fiscal" in df_scatter.columns else 0
+
             fig = px.scatter(
-                df_chart,
-                x="recursos_percibido",
-                y="gastos_pagado",
+                df_scatter,
+                x="recursos_millones",
+                y="gastos_millones",
                 size="Muni_Poblacion_2022",
                 hover_name="Muni_Nombre",
-                color="balance_fiscal" if "balance_fiscal" in df_chart.columns else None,
+                color="balance_millones" if "balance_fiscal" in df_chart.columns else None,
                 color_continuous_scale="RdYlGn",
-                size_max=50
+                size_max=50,
+                custom_data=["Muni_Nombre", "recursos_millones", "gastos_millones", "Muni_Poblacion_2022"]
+            )
+            # Formato hover personalizado
+            fig.update_traces(
+                hovertemplate="<b>%{customdata[0]}</b><br>" +
+                              "Recursos: $ %{customdata[1]:,.1f} M<br>" +
+                              "Gastos: $ %{customdata[2]:,.1f} M<br>" +
+                              "Población: %{customdata[3]:,.0f}<extra></extra>"
             )
             # Línea de equilibrio
-            max_val = max(df_chart["recursos_percibido"].max(), df_chart["gastos_pagado"].max())
+            max_val = max(df_scatter["recursos_millones"].max(), df_scatter["gastos_millones"].max())
             fig.add_trace(go.Scatter(
                 x=[0, max_val],
                 y=[0, max_val],
                 mode="lines",
                 line=dict(dash="dash", color="gray"),
-                name="Equilibrio"
+                name="Equilibrio",
+                hoverinfo="skip"
             ))
             fig.update_layout(
                 height=400,
-                margin={"l": 0, "r": 0, "t": 0, "b": 0}
+                margin={"l": 0, "r": 0, "t": 10, "b": 0}
             )
-            fig.update_xaxes(title="Recursos Percibidos ($)")
-            fig.update_yaxes(title="Gastos Pagados ($)")
+            fig.update_xaxes(title="Recursos Percibidos (millones $)", tickformat=",.0f")
+            fig.update_yaxes(title="Gastos Pagados (millones $)", tickformat=",.0f")
             st.plotly_chart(fig, use_container_width=True)
 
     with tab4:
-        st.markdown("**Comparación Recursos Percibidos vs Gastos Pagados**")
-        if "recursos_percibido" in df_chart.columns and "gastos_pagado" in df_chart.columns:
-            # Preparar datos para gráfico de barras agrupadas
-            df_compare = df_chart[["Muni_Nombre", "recursos_percibido", "gastos_pagado"]].copy()
-            df_compare = df_compare.dropna()
-            df_compare["diferencia"] = df_compare["recursos_percibido"] - df_compare["gastos_pagado"]
+        st.markdown("**Distribución del Balance Fiscal por Sección Electoral**")
+        if "balance_fiscal" in df_chart.columns and "Muni_SeccionElectoral" in df_chart.columns:
+            # Preparar datos para boxplot
+            df_boxplot = df_chart[["Muni_Nombre", "Muni_SeccionElectoral", "balance_fiscal"]].copy()
+            df_boxplot = df_boxplot.dropna(subset=["balance_fiscal", "Muni_SeccionElectoral"])
 
-            # Ordenar por diferencia (superávit a déficit)
-            df_compare = df_compare.sort_values("diferencia", ascending=False)
+            # Convertir balance a millones para mejor visualización
+            df_boxplot["balance_millones"] = df_boxplot["balance_fiscal"] / 1_000_000
 
-            # Selector de cantidad de municipios a mostrar
-            n_munis = st.slider("Cantidad de municipios a mostrar:", min_value=10, max_value=min(50, len(df_compare)), value=20, key="slider_recursos_gastos")
+            # Calcular orden por balance promedio (mayor a menor)
+            orden_secciones = df_boxplot.groupby("Muni_SeccionElectoral")["balance_millones"].mean().sort_values(ascending=False).index.tolist()
 
-            # Tomar los top N
-            df_top = df_compare.head(n_munis)
-
-            # Transformar a formato largo para barras agrupadas
-            df_melted = pd.melt(
-                df_top,
-                id_vars=["Muni_Nombre", "diferencia"],
-                value_vars=["recursos_percibido", "gastos_pagado"],
-                var_name="Tipo",
-                value_name="Monto"
-            )
-            df_melted["Tipo"] = df_melted["Tipo"].map({
-                "recursos_percibido": "Recursos Percibidos",
-                "gastos_pagado": "Gastos Pagados"
-            })
-
-            # Crear gráfico de barras agrupadas
-            fig = px.bar(
-                df_melted,
-                x="Muni_Nombre",
-                y="Monto",
-                color="Tipo",
-                barmode="group",
-                color_discrete_map={
-                    "Recursos Percibidos": "#2ecc71",
-                    "Gastos Pagados": "#e74c3c"
-                },
-                hover_data={"Monto": ":,.0f"}
+            # Crear boxplot
+            fig = px.box(
+                df_boxplot,
+                x="Muni_SeccionElectoral",
+                y="balance_millones",
+                color="Muni_SeccionElectoral",
+                category_orders={"Muni_SeccionElectoral": orden_secciones},
+                points="outliers",
+                hover_data=["Muni_Nombre"]
             )
 
             fig.update_layout(
-                height=500,
-                margin={"l": 0, "r": 0, "t": 30, "b": 100},
-                xaxis_tickangle=-45,
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                )
+                height=450,
+                margin={"l": 0, "r": 0, "t": 10, "b": 0},
+                showlegend=False,
+                xaxis_tickangle=-45
             )
-            fig.update_xaxes(title="")
-            fig.update_yaxes(title="Monto ($)", tickformat=",")
+            fig.update_xaxes(title="Sección Electoral")
+            fig.update_yaxes(title="Balance Fiscal (millones $)", tickformat=",.0f")
+            fig.update_traces(
+                hovertemplate="<b>%{customdata[0]}</b><br>Balance: $ %{y:,.1f} M<extra></extra>"
+            )
             st.plotly_chart(fig, use_container_width=True)
 
-            # Mostrar tabla resumen
-            st.markdown("**Resumen de diferencias (Recursos - Gastos)**")
-            col1, col2, col3 = st.columns(3)
+            # Tabla resumen por sección electoral
+            st.markdown("**Resumen por Sección Electoral**")
+            df_resumen = df_boxplot.groupby("Muni_SeccionElectoral").agg({
+                "Muni_Nombre": "count",
+                "balance_fiscal": ["sum", "mean", "median", "min", "max"]
+            }).round(0)
+            df_resumen.columns = ["Municipios", "Total", "Promedio", "Mediana", "Mínimo", "Máximo"]
+            df_resumen = df_resumen.sort_values("Promedio", ascending=False)
 
-            superavit = df_compare[df_compare["diferencia"] > 0]
-            deficit = df_compare[df_compare["diferencia"] < 0]
-            equilibrio = df_compare[df_compare["diferencia"] == 0]
+            # Formatear valores en millones
+            for col in ["Total", "Promedio", "Mediana", "Mínimo", "Máximo"]:
+                df_resumen[col] = df_resumen[col].apply(
+                    lambda x: f"$ {x/1_000_000:,.1f} M" if pd.notna(x) else "—"
+                )
 
-            with col1:
-                st.metric(
-                    "🟢 Municipios con Superávit",
-                    len(superavit),
-                    f"Total: {fmt_money_millions(superavit['diferencia'].sum())}"
-                )
-            with col2:
-                st.metric(
-                    "🔴 Municipios con Déficit",
-                    len(deficit),
-                    f"Total: {fmt_money_millions(deficit['diferencia'].sum())}"
-                )
-            with col3:
-                st.metric(
-                    "🟡 Municipios en Equilibrio",
-                    len(equilibrio)
-                )
+            df_resumen.index.name = "Sección Electoral"
+            st.dataframe(df_resumen, use_container_width=True)
+
+        elif "balance_fiscal" not in df_chart.columns:
+            st.warning("No hay datos de balance fiscal disponibles.")
+        else:
+            st.warning("No hay datos de Sección Electoral disponibles.")
 
     with tab5:
         st.markdown("**Explorador de Jurisdicciones, Programas y Metas**")
@@ -1822,46 +1894,6 @@ def render_resumen_general(
         juri_ids = tuple(df_juri["ID_Jurisdiccion"].tolist())
         df_prog, _ = fetch_programas_doc(juri_ids)
 
-    # ===== FILTROS (fila superior con borde) =====
-    st.markdown("**🔍 Filtros:**")
-    fc1, fc2, fc3, fc4 = st.columns([1, 1, 1, 1])
-    with fc1:
-        juri_options = ["Todas"] + (df_juri["Juri_Nombre"].tolist() if not df_juri.empty else [])
-        sel_juri = st.selectbox("🏛️ Jurisdicción", juri_options, key="filter_juri_select")
-        if sel_juri != "Todas":
-            st.session_state.filter_jurisdiccion = sel_juri
-        else:
-            st.session_state.filter_jurisdiccion = None
-
-    with fc2:
-        # Filtrar programas por jurisdicción seleccionada
-        if st.session_state.filter_jurisdiccion and not df_prog.empty and not df_juri.empty:
-            juri_row = df_juri[df_juri["Juri_Nombre"] == st.session_state.filter_jurisdiccion]
-            if not juri_row.empty:
-                juri_id = juri_row.iloc[0]["ID_Jurisdiccion"]
-                df_prog_filtered = df_prog[df_prog["ID_Jurisdiccion"] == juri_id]
-            else:
-                df_prog_filtered = df_prog
-        else:
-            df_prog_filtered = df_prog
-
-        prog_options = ["Todos"] + (df_prog_filtered["Prog_Nombre"].tolist() if not df_prog_filtered.empty else [])
-        sel_prog = st.selectbox("📋 Programa", prog_options, key="filter_prog_select")
-        if sel_prog != "Todos":
-            st.session_state.filter_programa = sel_prog
-        else:
-            st.session_state.filter_programa = None
-
-    # Mostrar totales en filtros
-    with fc3:
-        if not df_prog.empty and "Prog_Vigente" in df_prog.columns:
-            tot_vig = df_prog["Prog_Vigente"].sum()
-            st.metric("Total Vigente", f"${int(tot_vig/1e6)}M")
-    with fc4:
-        if not df_prog.empty and "Prog_Devengado" in df_prog.columns:
-            tot_dev = df_prog["Prog_Devengado"].sum()
-            st.metric("Total Devengado", f"${int(tot_dev/1e6)}M")
-
     # Calcular totales
     if "Rec_Nombre" in df_recursos.columns:
         df_recursos["Rec_Nombre_Norm"] = df_recursos["Rec_Nombre"].str.strip().str.lower()
@@ -1885,23 +1917,23 @@ def render_resumen_general(
 
     with c1:
         pct = int(total_rec_per / total_rec_vig * 100) if total_rec_vig > 0 else 0
-        st.metric("💰 Rec Vig", fmt_money_full(total_rec_vig))
-        st.metric("Percibido", fmt_money_full(total_rec_per), delta=f"{pct}%")
+        st.metric("💰 Rec Vig", fmt_money_millions(total_rec_vig))
+        st.metric("Percibido", fmt_money_millions(total_rec_per), delta=f"{pct}%")
 
     with c2:
         pct = int(total_gas_pag / total_gas_vig * 100) if total_gas_vig > 0 else 0
-        st.metric("💸 Gas Vig", fmt_money_full(total_gas_vig))
-        st.metric("Pagado", fmt_money_full(total_gas_pag), delta=f"{pct}%")
+        st.metric("💸 Gas Vig", fmt_money_millions(total_gas_vig))
+        st.metric("Pagado", fmt_money_millions(total_gas_pag), delta=f"{pct}%")
 
     with c3:
-        st.metric("⚖️ Bal Pres", fmt_money_full(diff_vig), delta="+" if diff_vig >= 0 else "-", delta_color="normal" if diff_vig >= 0 else "inverse")
-        st.metric("Bal Finan", fmt_money_full(diff_eje), delta="+" if diff_eje >= 0 else "-", delta_color="normal" if diff_eje >= 0 else "inverse")
+        st.metric("⚖️ Bal Pres", fmt_money_millions(diff_vig), delta="+" if diff_vig >= 0 else "-", delta_color="normal" if diff_vig >= 0 else "inverse")
+        st.metric("Bal Finan", fmt_money_millions(diff_eje), delta="+" if diff_eje >= 0 else "-", delta_color="normal" if diff_eje >= 0 else "inverse")
 
     with c4:
         if es_proyectado and factor_proy != 1.0:
             st.caption(f"📊 Proy x{factor_proy}")
-        st.caption(f"Rec: {int(total_rec_per/1e6)}M" if total_rec_per > 0 else "")
-        st.caption(f"Gas: {int(total_gas_pag/1e6)}M" if total_gas_pag > 0 else "")
+        st.caption(f"Rec: {fmt_money_millions(total_rec_per)}" if total_rec_per > 0 else "")
+        st.caption(f"Gas: {fmt_money_millions(total_gas_pag)}" if total_gas_pag > 0 else "")
 
     with c5:
         df_c = pd.DataFrame({"X": ["Rec", "Gas", "Dif"], "V": [total_rec_vig, total_gas_vig, diff_vig]})
@@ -2042,7 +2074,45 @@ def render_resumen_general(
 
     # ===== FILA 4: Jurisdicciones, Programas, Metas (expandidas con filtros) =====
     st.markdown("---")
-    st.caption("🏛️ Jurisdicciones / Programas / Metas")
+    st.markdown("### 🏛️ Jurisdicciones / Programas / Metas")
+
+    # ===== FILTROS EN ESTA SECCIÓN =====
+    fc1, fc2, fc3, fc4 = st.columns([1, 1, 1, 1])
+    with fc1:
+        juri_options = ["Todas"] + (df_juri["Juri_Nombre"].tolist() if not df_juri.empty else [])
+        sel_juri = st.selectbox("🏛️ Filtrar Jurisdicción", juri_options, key="filter_juri_select_section")
+        if sel_juri != "Todas":
+            st.session_state.filter_jurisdiccion = sel_juri
+        else:
+            st.session_state.filter_jurisdiccion = None
+
+    with fc2:
+        # Filtrar programas por jurisdicción seleccionada
+        if st.session_state.filter_jurisdiccion and not df_prog.empty and not df_juri.empty:
+            juri_row = df_juri[df_juri["Juri_Nombre"] == st.session_state.filter_jurisdiccion]
+            if not juri_row.empty:
+                juri_id = juri_row.iloc[0]["ID_Jurisdiccion"]
+                df_prog_for_filter = df_prog[df_prog["ID_Jurisdiccion"] == juri_id]
+            else:
+                df_prog_for_filter = df_prog
+        else:
+            df_prog_for_filter = df_prog
+
+        prog_options = ["Todos"] + (df_prog_for_filter["Prog_Nombre"].tolist() if not df_prog_for_filter.empty else [])
+        sel_prog = st.selectbox("📋 Filtrar Programa", prog_options, key="filter_prog_select_section")
+        if sel_prog != "Todos":
+            st.session_state.filter_programa = sel_prog
+        else:
+            st.session_state.filter_programa = None
+
+    with fc3:
+        if not df_prog.empty and "Prog_Vigente" in df_prog.columns:
+            tot_vig = df_prog["Prog_Vigente"].sum()
+            st.metric("Total Vigente", fmt_money_millions(tot_vig))
+    with fc4:
+        if not df_prog.empty and "Prog_Devengado" in df_prog.columns:
+            tot_dev = df_prog["Prog_Devengado"].sum()
+            st.metric("Total Devengado", fmt_money_millions(tot_dev))
 
     # Aplicar filtros
     df_juri_display = df_juri.copy() if not df_juri.empty else pd.DataFrame()
@@ -2057,10 +2127,69 @@ def render_resumen_general(
     if st.session_state.filter_programa and not df_prog_display.empty:
         df_prog_display = df_prog_display[df_prog_display["Prog_Nombre"] == st.session_state.filter_programa]
 
+    # ===== TREEMAPS =====
+    tree_col1, tree_col2 = st.columns(2)
+
+    with tree_col1:
+        st.markdown("**Jurisdicciones por Monto Vigente**")
+        if not df_juri.empty and not df_prog.empty:
+            # Preparar datos para treemap de jurisdicciones
+            agg_juri = df_prog.groupby("ID_Jurisdiccion").agg({"Prog_Vigente": "sum"}).reset_index()
+            df_juri_tree = df_juri.merge(agg_juri, on="ID_Jurisdiccion", how="left").fillna(0)
+            df_juri_tree = df_juri_tree[df_juri_tree["Prog_Vigente"] > 0]
+
+            if not df_juri_tree.empty:
+                df_juri_tree["Monto_Display"] = df_juri_tree["Prog_Vigente"].apply(lambda x: fmt_money_millions(x))
+                fig = px.treemap(
+                    df_juri_tree,
+                    path=["Juri_Nombre"],
+                    values="Prog_Vigente",
+                    color="Prog_Vigente",
+                    color_continuous_scale="Blues",
+                    custom_data=["Juri_Nombre", "Monto_Display"]
+                )
+                fig.update_traces(
+                    texttemplate="<b>%{label}</b><br>%{customdata[1]}",
+                    hovertemplate="<b>%{label}</b><br>Vigente: %{customdata[1]}<extra></extra>"
+                )
+                fig.update_layout(height=250, margin={"l": 0, "r": 0, "t": 10, "b": 0}, coloraxis_showscale=False)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.caption("Sin datos")
+        else:
+            st.caption("Sin datos")
+
+    with tree_col2:
+        st.markdown("**Programas por Monto Vigente**")
+        if not df_prog_display.empty and "Prog_Vigente" in df_prog_display.columns:
+            df_prog_tree = df_prog_display[df_prog_display["Prog_Vigente"] > 0].copy()
+
+            if not df_prog_tree.empty:
+                df_prog_tree["Monto_Display"] = df_prog_tree["Prog_Vigente"].apply(lambda x: fmt_money_millions(x))
+                fig = px.treemap(
+                    df_prog_tree,
+                    path=["Prog_Nombre"],
+                    values="Prog_Vigente",
+                    color="Prog_Vigente",
+                    color_continuous_scale="Greens",
+                    custom_data=["Prog_Nombre", "Monto_Display"]
+                )
+                fig.update_traces(
+                    texttemplate="<b>%{label}</b><br>%{customdata[1]}",
+                    hovertemplate="<b>%{label}</b><br>Vigente: %{customdata[1]}<extra></extra>"
+                )
+                fig.update_layout(height=250, margin={"l": 0, "r": 0, "t": 10, "b": 0}, coloraxis_showscale=False)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.caption("Sin datos")
+        else:
+            st.caption("Sin datos")
+
+    # ===== TABLAS DETALLE =====
     tc1, tc2, tc3 = st.columns([1, 1.5, 1])
 
     with tc1:
-        st.markdown("**Jurisdicciones**")
+        st.markdown("**Detalle Jurisdicciones**")
         if not df_juri_display.empty:
             if not df_prog.empty:
                 agg = df_prog.groupby("ID_Jurisdiccion").agg({"Prog_Vigente": "sum", "Prog_Devengado": "sum", "Prog_Pagado": "sum"}).reset_index()
@@ -2068,22 +2197,22 @@ def render_resumen_general(
                 total_vig_juri = df_juri_display["Prog_Vigente"].sum()
                 df_juri_display["%Eje"] = df_juri_display.apply(lambda r: f"{int(r['Prog_Pagado']/r['Prog_Vigente']*100)}%" if r["Prog_Vigente"] > 0 else "—", axis=1)
                 df_juri_display["%Peso"] = df_juri_display.apply(lambda r: f"{int(r['Prog_Vigente']/total_vig_juri*100)}%" if total_vig_juri > 0 else "—", axis=1)
-                df_juri_display["Vig"] = df_juri_display["Prog_Vigente"].apply(lambda x: f"{int(x/1e6)}M" if x >= 1e6 else f"{int(x/1e3)}K")
-                st.dataframe(df_juri_display[["Juri_Nombre", "Vig", "%Eje", "%Peso"]].rename(columns={"Juri_Nombre": "Jurisdicción"}), use_container_width=True, hide_index=True, height=200)
+                df_juri_display["Vigente"] = df_juri_display["Prog_Vigente"].apply(lambda x: fmt_money_millions(x))
+                st.dataframe(df_juri_display[["Juri_Nombre", "Vigente", "%Eje", "%Peso"]].rename(columns={"Juri_Nombre": "Jurisdicción"}), use_container_width=True, hide_index=True, height=200)
             else:
                 st.dataframe(df_juri_display[["Juri_Nombre"]].rename(columns={"Juri_Nombre": "Jurisdicción"}), use_container_width=True, hide_index=True, height=200)
         else:
             st.caption("—")
 
     with tc2:
-        st.markdown("**Programas**")
+        st.markdown("**Detalle Programas**")
         if not df_prog_display.empty:
             total_vig_prog = df_prog_display["Prog_Vigente"].sum()
-            df_prog_display["Vig"] = df_prog_display["Prog_Vigente"].apply(lambda x: f"{int(x/1e6)}M" if x >= 1e6 else f"{int(x/1e3)}K")
-            df_prog_display["Dev"] = df_prog_display["Prog_Devengado"].apply(lambda x: f"{int(x/1e6)}M" if x >= 1e6 else f"{int(x/1e3)}K") if "Prog_Devengado" in df_prog_display.columns else "—"
+            df_prog_display["Vigente"] = df_prog_display["Prog_Vigente"].apply(lambda x: fmt_money_millions(x))
+            df_prog_display["Devengado"] = df_prog_display["Prog_Devengado"].apply(lambda x: fmt_money_millions(x)) if "Prog_Devengado" in df_prog_display.columns else "—"
             df_prog_display["%D/V"] = df_prog_display.apply(lambda r: f"{int(r['Prog_Devengado']/r['Prog_Vigente']*100)}%" if r["Prog_Vigente"] > 0 and "Prog_Devengado" in df_prog_display.columns else "—", axis=1)
             df_prog_display["%Peso"] = df_prog_display.apply(lambda r: f"{int(r['Prog_Vigente']/total_vig_prog*100)}%" if total_vig_prog > 0 else "—", axis=1)
-            cols_prog = ["Prog_Nombre", "Vig", "Dev", "%D/V", "%Peso"]
+            cols_prog = ["Prog_Nombre", "Vigente", "Devengado", "%D/V", "%Peso"]
             st.dataframe(df_prog_display[cols_prog].rename(columns={"Prog_Nombre": "Programa"}), use_container_width=True, hide_index=True, height=200)
         else:
             st.caption("—")
