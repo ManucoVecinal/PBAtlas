@@ -619,6 +619,79 @@ def fetch_activos_por_municipio() -> Tuple[pd.DataFrame, Optional[str]]:
         return pd.DataFrame(), repr(e)
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_situacion_patrimonial_por_municipio() -> Tuple[pd.DataFrame, Optional[str]]:
+    """Obtiene situación patrimonial completa por municipio desde bd_situacionpatrimonial.
+
+    Retorna DataFrame con columnas:
+    - activo_total: suma de registros tipo ACTIVO
+    - pasivo_total: suma de registros tipo PASIVO
+    - patrimonio_total: suma de registros tipo PATRIMONIO
+    - pasivo_patrimonio: pasivo_total + patrimonio_total
+    """
+    if not USE_SUPABASE:
+        return pd.DataFrame(), "SUPABASE DESACTIVADO"
+    try:
+        sb = get_sb_client()
+
+        # Obtener documentos con municipio
+        res_docs = sb.table("BD_DocumentosCargados").select("ID_DocumentoCargado,ID_Municipio").limit(50000).execute()
+        _raise_if_error(res_docs)
+        df_docs = pd.DataFrame(res_docs.data or [])
+
+        if df_docs.empty:
+            return pd.DataFrame(), None
+
+        doc_to_muni = dict(zip(df_docs["ID_DocumentoCargado"].astype(str), df_docs["ID_Municipio"].astype(str)))
+
+        # Obtener situación patrimonial completa
+        res_pat = sb.table("bd_situacionpatrimonial").select("ID_DocumentoCargado,SitPat_Tipo,SitPat_Saldo").limit(100000).execute()
+        _raise_if_error(res_pat)
+        df_pat = pd.DataFrame(res_pat.data or [])
+
+        if df_pat.empty:
+            return pd.DataFrame(columns=["ID_Municipio", "activo_total", "pasivo_total", "patrimonio_total", "pasivo_patrimonio"]), None
+
+        # Normalizar tipo
+        df_pat["SitPat_Tipo_norm"] = df_pat["SitPat_Tipo"].astype(str).str.strip().str.lower()
+
+        # Mapear a municipio
+        df_pat["ID_Municipio"] = df_pat["ID_DocumentoCargado"].astype(str).map(doc_to_muni)
+        df_pat = df_pat.dropna(subset=["ID_Municipio"])
+
+        # Convertir saldos a numérico
+        df_pat["SitPat_Saldo"] = pd.to_numeric(df_pat["SitPat_Saldo"], errors="coerce").fillna(0)
+
+        # Separar por tipo
+        df_activo = df_pat[df_pat["SitPat_Tipo_norm"] == "activo"]
+        df_pasivo = df_pat[df_pat["SitPat_Tipo_norm"] == "pasivo"]
+        df_patrimonio = df_pat[df_pat["SitPat_Tipo_norm"] == "patrimonio publico"]
+
+        # Sumar por municipio para cada tipo
+        activo_agg = df_activo.groupby("ID_Municipio")["SitPat_Saldo"].sum().reset_index()
+        activo_agg.columns = ["ID_Municipio", "activo_total"]
+
+        pasivo_agg = df_pasivo.groupby("ID_Municipio")["SitPat_Saldo"].sum().reset_index()
+        pasivo_agg.columns = ["ID_Municipio", "pasivo_total"]
+
+        patrimonio_agg = df_patrimonio.groupby("ID_Municipio")["SitPat_Saldo"].sum().reset_index()
+        patrimonio_agg.columns = ["ID_Municipio", "patrimonio_total"]
+
+        # Combinar todos los tipos
+        df_result = activo_agg.merge(pasivo_agg, on="ID_Municipio", how="outer")
+        df_result = df_result.merge(patrimonio_agg, on="ID_Municipio", how="outer")
+
+        # Rellenar NaN con 0
+        df_result = df_result.fillna(0)
+
+        # Calcular pasivo - patrimonio público (ambos son negativos)
+        df_result["pasivo_patrimonio"] = df_result["pasivo_total"] - df_result["patrimonio_total"]
+
+        return df_result, None
+    except Exception as e:
+        return pd.DataFrame(), repr(e)
+
+
 @st.cache_data(show_spinner=False, ttl=60)
 def fetch_documentos_muni(id_municipio: str) -> Tuple[pd.DataFrame, Optional[str]]:
     """Obtiene documentos de un municipio específico."""
@@ -1459,13 +1532,16 @@ def render_provincial_charts(df_base: pd.DataFrame, df_metrics: pd.DataFrame):
         how="left"
     )
 
-    # Obtener datos de activos
-    df_activos, err_activos = fetch_activos_por_municipio()
-    if not df_activos.empty and err_activos is None:
-        df_chart = df_chart.merge(df_activos, on="ID_Municipio", how="left")
+    # Obtener datos de situación patrimonial (activo, pasivo, patrimonio)
+    df_patrimonio, err_patrimonio = fetch_situacion_patrimonial_por_municipio()
+    if not df_patrimonio.empty and err_patrimonio is None:
+        df_chart = df_chart.merge(df_patrimonio, on="ID_Municipio", how="left")
         df_chart["activo_total"] = df_chart["activo_total"].fillna(0)
+        df_chart["pasivo_total"] = df_chart["pasivo_total"].fillna(0)
+        df_chart["patrimonio_total"] = df_chart["patrimonio_total"].fillna(0)
+        df_chart["pasivo_patrimonio"] = df_chart["pasivo_patrimonio"].fillna(0)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Top Municipios", "Distribución", "Comparativas", "Recursos vs Gastos", "Jurisdicciones y Programas"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Top Municipios", "Distribución", "Comparativas", "Recursos vs Gastos", "Jurisdicciones y Programas", "Situación Patrimonial"])
 
     with tab1:
         col1, col2 = st.columns(2)
@@ -1580,12 +1656,37 @@ def render_provincial_charts(df_base: pd.DataFrame, df_metrics: pd.DataFrame):
     with tab3:
         st.markdown("**Recursos vs Gastos por Municipio**")
         st.caption("El tamaño del círculo representa la población del municipio (Censo 2022)")
-        if "recursos_percibido" in df_chart.columns and "gastos_pagado" in df_chart.columns:
+
+        # Selector de modo de valores
+        col_selector, _ = st.columns([1, 3])
+        with col_selector:
+            modo_valores_rg = st.selectbox(
+                "Modo de valores:",
+                options=["Valores Absolutos", "Valores Proyectados"],
+                key="selector_modo_recursos_gastos"
+            )
+
+        # Determinar columnas a usar según modo
+        usar_proyectado = modo_valores_rg == "Valores Proyectados"
+        col_recursos = "recursos_percibido_proy" if usar_proyectado else "recursos_percibido"
+        col_gastos = "gastos_pagado_proy" if usar_proyectado else "gastos_pagado"
+        col_balance = "balance_fiscal_proy" if usar_proyectado else "balance_fiscal"
+
+        # Verificar disponibilidad de datos proyectados
+        if usar_proyectado:
+            if col_recursos not in df_chart.columns or col_gastos not in df_chart.columns:
+                st.warning("Datos proyectados no disponibles. Mostrando valores absolutos.")
+                col_recursos = "recursos_percibido"
+                col_gastos = "gastos_pagado"
+                col_balance = "balance_fiscal"
+                usar_proyectado = False
+
+        if col_recursos in df_chart.columns and col_gastos in df_chart.columns:
             # Crear copia con valores en millones para el gráfico
             df_scatter = df_chart.copy()
-            df_scatter["recursos_millones"] = df_scatter["recursos_percibido"] / 1_000_000
-            df_scatter["gastos_millones"] = df_scatter["gastos_pagado"] / 1_000_000
-            df_scatter["balance_millones"] = df_scatter["balance_fiscal"] / 1_000_000 if "balance_fiscal" in df_scatter.columns else 0
+            df_scatter["recursos_millones"] = df_scatter[col_recursos] / 1_000_000
+            df_scatter["gastos_millones"] = df_scatter[col_gastos] / 1_000_000
+            df_scatter["balance_millones"] = df_scatter[col_balance] / 1_000_000 if col_balance in df_scatter.columns else 0
 
             fig = px.scatter(
                 df_scatter,
@@ -1593,12 +1694,13 @@ def render_provincial_charts(df_base: pd.DataFrame, df_metrics: pd.DataFrame):
                 y="gastos_millones",
                 size="Muni_Poblacion_2022",
                 hover_name="Muni_Nombre",
-                color="balance_millones" if "balance_fiscal" in df_chart.columns else None,
+                color="balance_millones" if col_balance in df_chart.columns else None,
                 color_continuous_scale="RdYlGn",
                 size_max=50,
                 custom_data=["Muni_Nombre", "recursos_millones", "gastos_millones", "Muni_Poblacion_2022"]
             )
             # Formato hover personalizado
+            tipo_valor = "Proyectados" if usar_proyectado else "Absolutos"
             fig.update_traces(
                 hovertemplate="<b>%{customdata[0]}</b><br>" +
                               "Recursos: $ %{customdata[1]:,.1f} M<br>" +
@@ -1619,8 +1721,10 @@ def render_provincial_charts(df_base: pd.DataFrame, df_metrics: pd.DataFrame):
                 height=400,
                 margin={"l": 0, "r": 0, "t": 10, "b": 0}
             )
-            fig.update_xaxes(title="Recursos Percibidos (millones $)", tickformat=",.0f")
-            fig.update_yaxes(title="Gastos Pagados (millones $)", tickformat=",.0f")
+            # Actualizar etiquetas según modo
+            etiqueta_sufijo = " (Proyectados)" if usar_proyectado else ""
+            fig.update_xaxes(title=f"Recursos Percibidos{etiqueta_sufijo} (millones $)", tickformat=",.0f")
+            fig.update_yaxes(title=f"Gastos Pagados{etiqueta_sufijo} (millones $)", tickformat=",.0f")
             st.plotly_chart(fig, use_container_width=True)
 
     with tab4:
@@ -1864,6 +1968,138 @@ def render_provincial_charts(df_base: pd.DataFrame, df_metrics: pd.DataFrame):
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
+    with tab6:
+        st.markdown("**Situación Patrimonial: Activo vs Pasivo + Patrimonio**")
+        st.caption("El tamaño del círculo representa la población del municipio. El color indica la diferencia: verde (favorable, activo > pasivo+patrimonio), rojo (desfavorable).")
+
+        # Selector de modo de valores
+        col_selector_sp, _ = st.columns([1, 3])
+        with col_selector_sp:
+            modo_valores_sp = st.selectbox(
+                "Modo de valores:",
+                options=["Valores Absolutos", "Valores Per Cápita"],
+                key="selector_modo_situacion_patrimonial"
+            )
+
+        # Verificar si hay datos patrimoniales
+        if "activo_total" in df_chart.columns and "pasivo_patrimonio" in df_chart.columns:
+            # Filtrar municipios con datos patrimoniales (incluir negativos)
+            df_pat_chart = df_chart[
+                (df_chart["activo_total"] != 0) | (df_chart["pasivo_patrimonio"] != 0)
+            ].copy()
+
+            if df_pat_chart.empty:
+                st.info("No hay municipios con datos patrimoniales disponibles.")
+            else:
+                usar_per_capita = modo_valores_sp == "Valores Per Cápita"
+
+                if usar_per_capita and "Muni_Poblacion_2022" in df_pat_chart.columns:
+                    # Calcular valores per cápita
+                    df_pat_chart["activo_display"] = df_pat_chart.apply(
+                        lambda r: r["activo_total"] / r["Muni_Poblacion_2022"]
+                        if r["Muni_Poblacion_2022"] > 0 else 0, axis=1
+                    )
+                    df_pat_chart["pasivo_pat_display"] = df_pat_chart.apply(
+                        lambda r: r["pasivo_patrimonio"] / r["Muni_Poblacion_2022"]
+                        if r["Muni_Poblacion_2022"] > 0 else 0, axis=1
+                    )
+                    unidad_label = "Per Cápita ($ por habitante)"
+                else:
+                    # Valores en millones
+                    df_pat_chart["activo_display"] = df_pat_chart["activo_total"] / 1_000_000
+                    df_pat_chart["pasivo_pat_display"] = df_pat_chart["pasivo_patrimonio"] / 1_000_000
+                    unidad_label = "(millones $)"
+
+                # Calcular diferencia (siempre en la misma escala que display)
+                df_pat_chart["diferencia_patrimonial"] = df_pat_chart["activo_display"] - df_pat_chart["pasivo_pat_display"]
+
+                # Crear gráfico scatter
+                fig = px.scatter(
+                    df_pat_chart,
+                    x="activo_display",
+                    y="pasivo_pat_display",
+                    size="Muni_Poblacion_2022",
+                    hover_name="Muni_Nombre",
+                    color="diferencia_patrimonial",
+                    color_continuous_scale="RdYlGn",
+                    color_continuous_midpoint=0,
+                    size_max=50,
+                    custom_data=["Muni_Nombre", "activo_display", "pasivo_pat_display", "diferencia_patrimonial", "Muni_Poblacion_2022"]
+                )
+
+                # Formato hover personalizado
+                if usar_per_capita:
+                    hover_template = (
+                        "<b>%{customdata[0]}</b><br>" +
+                        "Activo: $ %{customdata[1]:,.0f} per cápita<br>" +
+                        "Pasivo+Patrimonio: $ %{customdata[2]:,.0f} per cápita<br>" +
+                        "Diferencia: $ %{customdata[3]:,.0f} per cápita<br>" +
+                        "Población: %{customdata[4]:,.0f}<extra></extra>"
+                    )
+                else:
+                    hover_template = (
+                        "<b>%{customdata[0]}</b><br>" +
+                        "Activo: $ %{customdata[1]:,.1f} M<br>" +
+                        "Pasivo+Patrimonio: $ %{customdata[2]:,.1f} M<br>" +
+                        "Diferencia: $ %{customdata[3]:,.1f} M<br>" +
+                        "Población: %{customdata[4]:,.0f}<extra></extra>"
+                    )
+
+                fig.update_traces(hovertemplate=hover_template)
+
+                # Línea de equilibrio (diagonal) - incluir valores negativos
+                min_val = min(
+                    0,
+                    df_pat_chart["activo_display"].min(),
+                    df_pat_chart["pasivo_pat_display"].min()
+                )
+                max_val = max(
+                    df_pat_chart["activo_display"].max(),
+                    df_pat_chart["pasivo_pat_display"].max()
+                )
+                fig.add_trace(go.Scatter(
+                    x=[min_val, max_val],
+                    y=[min_val, max_val],
+                    mode="lines",
+                    line=dict(dash="dash", color="gray"),
+                    name="Equilibrio (Activo = Pasivo+Patrimonio)",
+                    hoverinfo="skip"
+                ))
+
+                fig.update_layout(
+                    height=450,
+                    margin={"l": 0, "r": 0, "t": 10, "b": 0},
+                    coloraxis_colorbar=dict(
+                        title="Diferencia",
+                        tickformat=",.0f" if usar_per_capita else ",.1f"
+                    )
+                )
+                fig.update_xaxes(title=f"Activo Total {unidad_label}", tickformat=",.0f" if usar_per_capita else ",.0f")
+                # Configurar eje Y con rango que incluya valores negativos
+                y_range_min = min_val * 1.1 if min_val < 0 else min_val
+                y_range_max = max_val * 1.1
+                fig.update_yaxes(
+                    title=f"Pasivo + Patrimonio {unidad_label}",
+                    tickformat=",.0f" if usar_per_capita else ",.0f",
+                    range=[y_range_min, y_range_max]
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Métricas resumen
+                col_m1, col_m2, col_m3 = st.columns(3)
+                with col_m1:
+                    n_favorable = len(df_pat_chart[df_pat_chart["diferencia_patrimonial"] > 0])
+                    st.metric("Municipios con Activo > Pasivo+Patrimonio", n_favorable)
+                with col_m2:
+                    n_desfavorable = len(df_pat_chart[df_pat_chart["diferencia_patrimonial"] < 0])
+                    st.metric("Municipios con Activo < Pasivo+Patrimonio", n_desfavorable)
+                with col_m3:
+                    n_equilibrio = len(df_pat_chart[df_pat_chart["diferencia_patrimonial"] == 0])
+                    st.metric("Municipios en Equilibrio", n_equilibrio)
+        else:
+            st.info("No hay datos de situación patrimonial disponibles para mostrar este gráfico.")
+
 
 def render_resumen_general(
     doc_id: str,
@@ -2052,6 +2288,13 @@ def render_resumen_general(
             fig.add_trace(go.Bar(name="Pasivo", x=["Pas+Pat"], y=[pasivo], marker_color="#e74c3c", text=[f"{int(pasivo/1e6)}M"], textposition="inside"))
             fig.add_trace(go.Bar(name="Patrimonio", x=["Pas+Pat"], y=[patrimonio], marker_color="#3498db", text=[f"{int(patrimonio/1e6)}M"], textposition="inside"))
             fig.update_layout(barmode="relative", height=120, margin={"l": 0, "r": 0, "t": 0, "b": 0}, showlegend=False)
+            # Calcular rango del eje Y para incluir valores negativos
+            max_activo = act_corr + act_no_corr
+            min_pasivo_pat = min(0, pasivo, patrimonio, pasivo + patrimonio)
+            max_pasivo_pat = max(0, pasivo + patrimonio) if pasivo >= 0 and patrimonio >= 0 else max(0, pasivo, patrimonio)
+            y_min = min(0, min_pasivo_pat) * 1.1 if min_pasivo_pat < 0 else 0
+            y_max = max(max_activo, max_pasivo_pat) * 1.1
+            fig.update_yaxes(range=[y_min, y_max])
             fig.add_hline(y=0, line_color="gray", line_width=1)
             st.plotly_chart(fig, use_container_width=True)
         else:
